@@ -1,5 +1,6 @@
 const test = require('brittle')
-const { create, replicateAndSync, encode, same } = require('./helpers')
+const Corestore = require('corestore')
+const { create, replicate, replicateAndSync, sync, encode, same } = require('./helpers')
 
 test('links - writer sees previous writes via links', async function (t) {
   const auto1 = await create(t)
@@ -279,4 +280,68 @@ test('links - deep sequential chain', async function (t) {
   }
 
   t.ok(await same(auto1, auto2), 'peers converge after deep sequential chain')
+})
+
+// a follower that applied later-stamped nodes before meeting a chain of earlier
+// ones, each unblocked by the one before, re-applied that suffix once per chain
+// node: a reapply storm quadratic in the chain length (and a fresh join of a
+// busy base is nothing but such chains)
+test('links - a chain of late nodes re-applies the suffix once', async function (t) {
+  const SUFFIX = 20
+  const CHAIN = 10
+  const SKEW = 30 * 60 * 1000
+
+  // a reorder re-reads the undone nodes, so a fast-forwarded follower would
+  // wait on peers for the blocks it skipped
+  const root = await create(t, { fastForward: false })
+  const a = await create(t, root.key, { fastForward: false })
+  const b = await create(t, root.key, { fastForward: false })
+  // stamped half an hour ahead, so everything c writes sorts after the chain
+  const c = await create(t, root.key, { fastForward: false, now: () => Date.now() + SKEW })
+
+  await root.append(encode({ addWriter: a.local.id }))
+  await root.append(encode({ addWriter: b.local.id }))
+  await root.append(encode({ addWriter: c.local.id }))
+  await replicateAndSync(root, a, b, c)
+
+  for (let i = 0; i < SUFFIX; i++) await c.append(encode({ suffix: i }))
+
+  // a and b ack each other: every node links the previous one
+  const unreplicate = replicate(a, b)
+  for (let i = 0; i < CHAIN; i++) {
+    await a.append(encode({ ack: i, from: 'a' }))
+    await sync(a, b)
+    await b.append(encode({ ack: i, from: 'b' }))
+    await sync(a, b)
+  }
+  await unreplicate()
+
+  // the follower applies the suffix first and then meets the whole chain at
+  // once: fetched into its store while closed, so no block trickles into a drain
+  const storage = await t.tmp()
+  const follower = await create(t, root.key, { storage, fastForward: false })
+  await replicateAndSync(root, follower)
+  await replicateAndSync(c, follower)
+  await follower.close()
+
+  const store = new Corestore(storage, { manifestVersion: 2 })
+  for (const w of [a, b]) {
+    const core = store.get(w.local.key)
+    await core.ready()
+    const unreplicate = replicate(w.store, store)
+    await core.download({ start: 0, end: w.local.length }).done()
+    await unreplicate()
+  }
+  await store.close()
+
+  // the cores that changed while closed are hinted before the first drain
+  const reopened = await create(t, root.key, { storage, fastForward: false })
+  await reopened.update()
+
+  t.is(reopened.stats.undos, 1, 'the suffix is undone once')
+  t.is(reopened.stats.applies, 2 * CHAIN + SUFFIX, 'the suffix is re-applied once')
+
+  await replicateAndSync(root, a, b, c, reopened)
+  t.ok(await same(root, a, b, c, reopened), 'the follower converges with the writers')
+  t.alike(reopened.system.hash, c.system.hash, 'and lands on the same system')
 })

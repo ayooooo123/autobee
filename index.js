@@ -1417,20 +1417,20 @@ module.exports = class Autobee extends ReadyResource {
     const next = await this.writers.nextPendingNode({ local })
     if (next === null) return false
 
-    const { writer: w, batch } = next
+    await this._applyPending(next)
+    return true
+  }
 
+  async _applyPending({ writer: w, batch }) {
     const optimistic = this.optimistic && batch[0].optimistic
 
     if (optimistic || w.isAdded || (w.isRemoved && w.hasReferrals())) {
       await this._processBatch(batch)
+      w.notify(batch)
+      this._needsUpdate = true
     } else {
       w.removePending()
-      return true
     }
-
-    w.notify(batch)
-    this._needsUpdate = true
-    return true
   }
 
   async prepareBatch(batch) {
@@ -1465,6 +1465,15 @@ module.exports = class Autobee extends ReadyResource {
 
     while (stack.length) {
       const batch = stack.pop()
+
+      // a reorder re-applies every node after the late one, so a chain of late
+      // nodes, each unblocked by the previous, would re-apply it once per node
+      while (stack.length && !this._interrupting) {
+        const next = await this.writers.nextPendingNodeBefore(batch[0], stack)
+        if (next === null) break
+        await this._applyPending(next)
+      }
+
       const t = await this.prepareBatch(batch)
 
       if (t.view) {
