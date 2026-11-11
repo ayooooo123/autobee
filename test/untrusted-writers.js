@@ -105,3 +105,65 @@ test('untrusted-writers - a stalled mirror fast-forwards once the admin moves on
 
   t.ok(await same(admin, mirror), 'the mirror converged on the admin')
 })
+
+test('untrusted-writers - a removed writer is no longer trusted from cache', async function (t) {
+  const owner = await create(t)
+  const device = await create(t, owner.key)
+
+  let revoked = false
+  let asked = 0
+  const follower = await create(t, owner.key, {
+    isTrusted: (key) => {
+      if (!b4a.equals(key, device.local.key)) return false
+      asked++
+      return !revoked
+    }
+  })
+
+  await owner.append(encode({ addWriter: device.local.id }))
+  await replicateAndSync(owner, device, follower)
+
+  t.ok(await follower.trusted.isTrusted(device.local.key), 'trusted while granted')
+  t.ok(await follower.trusted.isTrusted(device.local.key), 'answered again')
+  t.is(asked, 1, 'the second answer came from the cache')
+
+  revoked = true
+  await owner.append(encode({ removeWriter: device.local.id }))
+  await replicateAndSync(owner, follower)
+
+  t.absent(
+    await follower.trusted.isTrusted(device.local.key),
+    'the removal drops the cached answer'
+  )
+  t.is(asked, 2, 'the hook was asked again')
+})
+
+test('untrusted-writers - a removal during a pending trust answer is not trusted', async function (t) {
+  const owner = await create(t)
+  const device = await create(t, owner.key)
+
+  const answers = []
+  let deferred = false
+  const follower = await create(t, owner.key, {
+    isTrusted: () => (deferred ? new Promise((resolve) => answers.push(resolve)) : false)
+  })
+
+  await owner.append(encode({ addWriter: device.local.id }))
+  await replicateAndSync(owner, device, follower)
+  deferred = true
+
+  const first = follower.trusted.isTrusted(device.local.key)
+  const shared = follower.trusted.isTrusted(device.local.key)
+  t.is(answers.length, 1, 'one hook call in flight')
+
+  follower.trusted.forget(device.local.key)
+  answers[0](true)
+
+  t.absent(await first, 'the in-flight answer is not trusted after the removal')
+  t.absent(await shared, 'nor for a caller sharing it')
+
+  const again = follower.trusted.isTrusted(device.local.key)
+  t.is(answers.length, 2, 'nothing was cached: the hook is asked again')
+  answers[1](false)
+  t.absent(await again)
+})
